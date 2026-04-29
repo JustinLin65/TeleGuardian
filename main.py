@@ -1,4 +1,4 @@
-# TeleGuardian v1.1.0
+# TeleGuardian v2.0.0
 import logging
 import sqlite3
 import re
@@ -7,7 +7,7 @@ import asyncio
 import datetime
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
-from telegram import Update, MessageEntity, MessageOriginChannel, ChatPermissions, Message, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, MessageEntity, MessageOriginChannel, ChatPermissions, Message, InlineKeyboardButton, InlineKeyboardMarkup, User
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, Application, CommandHandler, CallbackQueryHandler
 
 # 加載 .env 檔案
@@ -31,17 +31,40 @@ if not TOKEN:
 def db_init():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute('CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)')
-    cursor.execute('CREATE TABLE IF NOT EXISTS whitelist (identifier TEXT PRIMARY KEY)')
+    cursor.execute('CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, username TEXT)')
+    cursor.execute('CREATE TABLE IF NOT EXISTS whitelist (user_id INTEGER PRIMARY KEY, username TEXT)')
     cursor.execute('CREATE TABLE IF NOT EXISTS channel_whitelist (channel_id INTEGER PRIMARY KEY)')
     cursor.execute('CREATE TABLE IF NOT EXISTS banned_words (word TEXT PRIMARY KEY)')
     cursor.execute('CREATE TABLE IF NOT EXISTS violations (user_id INTEGER PRIMARY KEY, count INTEGER DEFAULT 0)')
+    
+    # 欄位遷移邏輯
+    migration_tasks = [
+        ('admins', 'username', 'TEXT'),
+        ('whitelist', 'username', 'TEXT')
+    ]
+    for table, col, col_type in migration_tasks:
+        try:
+            cursor.execute(f'ALTER TABLE {table} ADD COLUMN {col} {col_type}')
+        except sqlite3.OperationalError: pass # 欄位已存在
+        
     conn.commit()
     conn.close()
 
 def check_in_db(table, column, value):
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
     cursor.execute(f'SELECT 1 FROM {table} WHERE {column} = ?', (value,))
+    exists = cursor.fetchone() is not None
+    conn.close()
+    return exists
+
+def is_whitelisted(val):
+    """檢查 ID 或 Username 是否在白名單中"""
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    if isinstance(val, int) or str(val).isdigit():
+        cursor.execute('SELECT 1 FROM whitelist WHERE user_id = ?', (int(val),))
+    else:
+        u_name = str(val).lstrip('@')
+        cursor.execute('SELECT 1 FROM whitelist WHERE username = ?', (u_name,))
     exists = cursor.fetchone() is not None
     conn.close()
     return exists
@@ -88,108 +111,255 @@ def schedule_delete(context: ContextTypes.DEFAULT_TYPE, message: Message):
         context.job_queue.run_once(delete_message_job, 180, data=message.message_id, chat_id=message.chat_id)
 
 # --- 輔助函式 ---
-def get_target_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.reply_to_message: return update.message.reply_to_message.from_user.id
-    if context.args:
-        try: return int(context.args[0])
-        except ValueError: return None
-    return None
+def get_batch_items(update: Update):
+    """獲取批量輸入項目，結合訊息文本、提及實體 (TEXT_MENTION) 與回覆訊息"""
+    items = []
+    message = update.message
+    if not message: return []
+    
+    # 1. 提取 TEXT_MENTION (提及姓名，通常用於無 Username 的用戶)
+    entities = message.entities or message.caption_entities or []
+    for ent in entities:
+        if ent.type == MessageEntity.TEXT_MENTION and ent.user:
+            items.append(ent.user)
+            
+    # 2. 處理文本行 (ID 或 @Username)
+    text = message.text or message.caption or ""
+    parts = text.split(None, 1)
+    if len(parts) >= 2:
+        lines = [line.strip() for line in parts[1].split('\n') if line.strip()]
+        items.extend(lines)
+        
+    # 3. 如果前兩者都沒有，且有回覆訊息，則獲取回覆者的 User 物件
+    if not items and message.reply_to_message:
+        items.append(message.reply_to_message.from_user)
+        
+    return items
 
 # --- 管理指令 ---
 async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_bot_admin(update.effective_user.id): return
-    target_id = get_target_user_id(update, context)
-    if not target_id:
-        msg = await update.message.reply_text("使用方式：\n1. 回覆訊息並輸入 /addadmin\n2. 輸入 /addadmin [ID]", message_thread_id=update.message.message_thread_id)
+    items = get_batch_items(update)
+    if not items:
+        msg = await update.message.reply_text("使用方式：\n1. 回覆訊息並輸入 /addadmin\n2. 輸入 /addadmin 並換行輸入多個 ID/Username", message_thread_id=update.message.message_thread_id)
         schedule_delete(context, msg); return
+    
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    try:
-        cursor.execute('INSERT INTO admins (user_id) VALUES (?)', (target_id,))
-        conn.commit()
-        msg = await update.message.reply_text(f"已成功添加管理員 {target_id}。", message_thread_id=update.message.message_thread_id)
-    except:
-        msg = await update.message.reply_text(f"用戶 {target_id} 已經是管理員。", message_thread_id=update.message.message_thread_id)
-    finally: conn.close()
+    success, failed = [], []
+    for item in items:
+        u_id, u_name = None, None
+        if isinstance(item, User):
+            u_id, u_name = item.id, item.username
+        else:
+            item_str = str(item).strip()
+            if item_str.startswith('@'): u_name = item_str.lstrip('@')
+            else:
+                try: u_id = int(item_str)
+                except: u_name = item_str
+        
+        try:
+            # 嘗試補全資訊：若有 ID 沒 Name，或有 Name 沒 ID
+            if u_id and not u_name:
+                try:
+                    # 優先嘗試在當前群組獲取成員資訊
+                    member = await context.bot.get_chat_member(update.effective_chat.id, u_id)
+                    u_name = member.user.username
+                except:
+                    try:
+                        # 失敗則嘗試全域獲取
+                        chat = await context.bot.get_chat(u_id)
+                        u_name = chat.username
+                    except: pass
+            elif not u_id and u_name:
+                try:
+                    chat = await context.bot.get_chat(f"@{u_name}")
+                    u_id, u_name = chat.id, chat.username
+                except: pass
+            
+            if u_id:
+                cursor.execute('INSERT INTO admins (user_id, username) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET username = excluded.username', (u_id, u_name))
+                success.append(f"{u_id}{f' (@{u_name})' if u_name else ''}")
+            else:
+                failed.append(f"{item} (無法獲取 ID)")
+        except Exception as e:
+            failed.append(f"{item} ({str(e)})")
+    conn.commit(); conn.close()
+    
+    res = []
+    if success: res.append(f"✅ 已添加管理員: {', '.join(success)}")
+    if failed: res.append(f"❌ 失敗: {', '.join(failed)}")
+    msg = await update.message.reply_text("\n".join(res), message_thread_id=update.message.message_thread_id)
     schedule_delete(context, msg)
 
 async def del_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_bot_admin(update.effective_user.id): return
-    target_id = get_target_user_id(update, context)
-    if not target_id or (FIRST_ADMIN_ID and str(target_id) == str(FIRST_ADMIN_ID)): return
+    items = get_batch_items(update)
+    if not items: return
+    
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    cursor.execute('DELETE FROM admins WHERE user_id = ?', (target_id,))
+    removed = []
+    for item in items:
+        try:
+            target_id = item.id if isinstance(item, User) else int(item)
+            if FIRST_ADMIN_ID and str(target_id) == str(FIRST_ADMIN_ID): continue
+            cursor.execute('DELETE FROM admins WHERE user_id = ?', (target_id,))
+            removed.append(str(target_id))
+        except: pass
     conn.commit(); conn.close()
-    msg = await update.message.reply_text(f"已移除管理員 {target_id}。", message_thread_id=update.message.message_thread_id)
-    schedule_delete(context, msg)
+    
+    if removed:
+        msg = await update.message.reply_text(f"已移除管理員: {', '.join(removed)}", message_thread_id=update.message.message_thread_id)
+        schedule_delete(context, msg)
 
 async def add_whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_bot_admin(update.effective_user.id): return
-    target_id = get_target_user_id(update, context)
-    if not target_id: return
+    items = get_batch_items(update)
+    if not items:
+        msg = await update.message.reply_text("使用方式：\n1. 回覆訊息並輸入 /addwl\n2. 輸入 /addwl 並換行輸入多個 ID/Username", message_thread_id=update.message.message_thread_id)
+        schedule_delete(context, msg); return
+    
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    try:
-        cursor.execute('INSERT INTO whitelist (identifier) VALUES (?)', (str(target_id),))
-        conn.commit()
-        msg = await update.message.reply_text(f"已添加 {target_id} 至白名單。", message_thread_id=update.message.message_thread_id)
-        schedule_delete(context, msg)
-    except: pass
-    finally: conn.close()
+    success, failed = [], []
+    for item in items:
+        u_id, u_name = None, None
+        if isinstance(item, User):
+            u_id, u_name = item.id, item.username
+        else:
+            item_str = str(item).strip()
+            if item_str.startswith('@'): u_name = item_str.lstrip('@')
+            else:
+                try: u_id = int(item_str)
+                except: u_name = item_str
+        
+        try:
+            # 嘗試補全資訊：若有 ID 沒 Name，或有 Name 沒 ID
+            if u_id and not u_name:
+                try:
+                    # 優先嘗試在當前群組獲取成員資訊
+                    member = await context.bot.get_chat_member(update.effective_chat.id, u_id)
+                    u_name = member.user.username
+                except:
+                    try:
+                        # 失敗則嘗試全域獲取
+                        chat = await context.bot.get_chat(u_id)
+                        u_name = chat.username
+                    except: pass
+            elif not u_id and u_name:
+                try:
+                    chat = await context.bot.get_chat(f"@{u_name}")
+                    u_id, u_name = chat.id, chat.username
+                except: pass
+            
+            if u_id:
+                cursor.execute('INSERT INTO whitelist (user_id, username) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET username = excluded.username', (u_id, u_name))
+                success.append(f"{u_id}{f' (@{u_name})' if u_name else ''}")
+            else:
+                failed.append(f"{item} (無法獲取 ID)")
+        except Exception as e:
+            failed.append(f"{item} ({str(e)})")
+    conn.commit(); conn.close()
+    
+    res = []
+    if success: res.append(f"✅ 已添加至白名單: {', '.join(success)}")
+    if failed: res.append(f"❌ 失敗: {', '.join(failed)}")
+    msg = await update.message.reply_text("\n".join(res), message_thread_id=update.message.message_thread_id)
+    schedule_delete(context, msg)
 
 async def del_whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_bot_admin(update.effective_user.id): return
-    target_id = get_target_user_id(update, context)
-    if not target_id: return
+    items = get_batch_items(update)
+    if not items: return
+    
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    cursor.execute('DELETE FROM whitelist WHERE identifier = ?', (str(target_id),))
+    removed = []
+    for item in items:
+        if isinstance(item, User):
+            cursor.execute('DELETE FROM whitelist WHERE user_id = ?', (item.id,))
+            removed.append(str(item.id))
+        else:
+            val = str(item).strip()
+            if val.isdigit():
+                cursor.execute('DELETE FROM whitelist WHERE user_id = ?', (int(val),))
+            else:
+                cursor.execute('DELETE FROM whitelist WHERE username = ?', (val.lstrip('@'),))
+            removed.append(val)
     conn.commit(); conn.close()
-    msg = await update.message.reply_text(f"已將 {target_id} 移出白名單。", message_thread_id=update.message.message_thread_id)
-    schedule_delete(context, msg)
+    
+    if removed:
+        msg = await update.message.reply_text(f"已從白名單移除: {', '.join(removed)}", message_thread_id=update.message.message_thread_id)
+        schedule_delete(context, msg)
 
 async def add_channel_whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_bot_admin(update.effective_user.id): return
-    if not context.args: return
-    try:
-        cid = int(context.args[0])
-        conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-        cursor.execute('INSERT INTO channel_whitelist (channel_id) VALUES (?)', (cid,))
-        conn.commit(); conn.close()
-        msg = await update.message.reply_text(f"已添加頻道 {cid} 至白名單。", message_thread_id=update.message.message_thread_id)
+    items = get_batch_items(update)
+    if not items: return
+    
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    added = []
+    for item in items:
+        try:
+            cid = int(item)
+            cursor.execute('INSERT INTO channel_whitelist (channel_id) VALUES (?)', (cid,))
+            added.append(str(cid))
+        except: pass
+    conn.commit(); conn.close()
+    
+    if added:
+        msg = await update.message.reply_text(f"已添加頻道至白名單: {', '.join(added)}", message_thread_id=update.message.message_thread_id)
         schedule_delete(context, msg)
-    except: pass
 
 async def del_channel_whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_bot_admin(update.effective_user.id): return
-    if not context.args: return
-    try:
-        cid = int(context.args[0])
-        conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-        cursor.execute('DELETE FROM channel_whitelist WHERE channel_id = ?', (cid,))
-        conn.commit(); conn.close()
-        msg = await update.message.reply_text(f"已移除頻道 {cid}。", message_thread_id=update.message.message_thread_id)
+    items = get_batch_items(update)
+    if not items: return
+    
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    removed = []
+    for item in items:
+        try:
+            cid = int(item)
+            cursor.execute('DELETE FROM channel_whitelist WHERE channel_id = ?', (cid,))
+            removed.append(str(cid))
+        except: pass
+    conn.commit(); conn.close()
+    
+    if removed:
+        msg = await update.message.reply_text(f"已移除頻道白名單: {', '.join(removed)}", message_thread_id=update.message.message_thread_id)
         schedule_delete(context, msg)
-    except: pass
 
 async def add_word_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_bot_admin(update.effective_user.id): return
-    if not context.args: return
-    word = " ".join(context.args)
+    items = get_batch_items(update)
+    if not items: return
+    
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    try:
-        cursor.execute('INSERT INTO banned_words (word) VALUES (?)', (word,))
-        conn.commit(); conn.close()
-        msg = await update.message.reply_text(f"已添加違禁詞：{word}", message_thread_id=update.message.message_thread_id)
+    added = []
+    for word in items:
+        try:
+            cursor.execute('INSERT INTO banned_words (word) VALUES (?)', (word,))
+            added.append(word)
+        except: pass
+    conn.commit(); conn.close()
+    
+    if added:
+        msg = await update.message.reply_text(f"已添加違禁詞: {', '.join(added)}", message_thread_id=update.message.message_thread_id)
         schedule_delete(context, msg)
-    except: pass
 
 async def del_word_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_bot_admin(update.effective_user.id): return
-    if not context.args: return
-    word = " ".join(context.args)
+    items = get_batch_items(update)
+    if not items: return
+    
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
-    cursor.execute('DELETE FROM banned_words WHERE word = ?', (word,))
+    removed = []
+    for word in items:
+        cursor.execute('DELETE FROM banned_words WHERE word = ?', (word,))
+        removed.append(word)
     conn.commit(); conn.close()
-    msg = await update.message.reply_text(f"已移除違禁詞：{word}", message_thread_id=update.message.message_thread_id)
-    schedule_delete(context, msg)
+    
+    if removed:
+        msg = await update.message.reply_text(f"已移除違禁詞: {', '.join(removed)}", message_thread_id=update.message.message_thread_id)
+        schedule_delete(context, msg)
 
 # --- 核心檢查邏輯 ---
 async def is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -289,7 +459,7 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message or update.edited_message
     if not message or not message.from_user: return
     user_id = message.from_user.id
-    if is_bot_admin(user_id) or check_in_db('whitelist', 'identifier', str(user_id)) or await is_group_admin(update, context): return
+    if is_bot_admin(user_id) or is_whitelisted(user_id) or await is_group_admin(update, context): return
 
     text, entities = (message.text or message.caption or ""), (message.entities or message.caption_entities or [])
     if any(e.type in [MessageEntity.URL, MessageEntity.TEXT_LINK] for e in entities):
@@ -316,11 +486,12 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for entity in entities:
         if entity.type == MessageEntity.MENTION:
-            if not check_in_db('whitelist', 'identifier', text[entity.offset : entity.offset + entity.length]):
+            mention_text = text[entity.offset : entity.offset + entity.length]
+            if not is_whitelisted(mention_text):
                 await message.delete()
                 await handle_violation_handler(update, context, user_id, "標記非白名單用戶"); return
         elif entity.type == MessageEntity.TEXT_MENTION:
-            if not check_in_db('whitelist', 'identifier', str(entity.user.id)):
+            if not is_whitelisted(entity.user.id):
                 await message.delete()
                 await handle_violation_handler(update, context, user_id, "標記非白名單用戶"); return
 
