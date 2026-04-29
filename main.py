@@ -1,4 +1,4 @@
-# TeleGuardian v1.0.0
+# TeleGuardian v1.1.0
 import logging
 import sqlite3
 import re
@@ -7,8 +7,8 @@ import asyncio
 import datetime
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
-from telegram import Update, MessageEntity, MessageOriginChannel, ChatPermissions, Message
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, Application, CommandHandler
+from telegram import Update, MessageEntity, MessageOriginChannel, ChatPermissions, Message, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, Application, CommandHandler, CallbackQueryHandler
 
 # 加載 .env 檔案
 load_dotenv()
@@ -61,6 +61,18 @@ def add_violation(user_id):
 def remove_violation(user_id):
     conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
     cursor.execute('DELETE FROM violations WHERE user_id = ?', (user_id,))
+    conn.commit(); conn.close()
+
+def decrement_violation(user_id):
+    conn = sqlite3.connect(DB_PATH); cursor = conn.cursor()
+    cursor.execute('SELECT count FROM violations WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    if row:
+        new_count = max(0, row[0] - 1)
+        if new_count == 0:
+            cursor.execute('DELETE FROM violations WHERE user_id = ?', (user_id,))
+        else:
+            cursor.execute('UPDATE violations SET count = ? WHERE user_id = ?', (new_count, user_id))
     conn.commit(); conn.close()
 
 # --- 自動刪除邏輯 ---
@@ -182,8 +194,10 @@ async def del_word_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- 核心檢查邏輯 ---
 async def is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or update.effective_chat.type == 'private': return False
-    admins = await context.bot.get_chat_administrators(update.effective_chat.id)
-    return any(admin.user.id == update.effective_user.id for admin in admins)
+    try:
+        admins = await context.bot.get_chat_administrators(update.effective_chat.id)
+        return any(admin.user.id == update.effective_user.id for admin in admins)
+    except: return False
 
 async def handle_violation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, reason: str):
     message = update.message or update.edited_message
@@ -203,8 +217,73 @@ async def handle_violation_handler(update: Update, context: ContextTypes.DEFAULT
         remove_violation(user_id)
 
     full_text = f"{action_text}\n<i>(此通知將在 3 分鐘後自動刪除)</i>"
-    notice_msg = await message.chat.send_message(text=full_text, parse_mode='HTML', message_thread_id=message.message_thread_id)
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ 忽略", callback_data=f"ignore_{user_id}"),
+            InlineKeyboardButton("🚫 永久封鎖", callback_data=f"ban_{user_id}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    notice_msg = await message.chat.send_message(
+        text=full_text, 
+        parse_mode='HTML', 
+        message_thread_id=message.message_thread_id,
+        reply_markup=reply_markup
+    )
     schedule_delete(context, notice_msg)
+
+async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    if not is_bot_admin(user_id) and not await is_group_admin(update, context):
+        await query.answer("❌ 您沒有權限執行此操作。", show_alert=True)
+        return
+
+    await query.answer()
+    data = query.data
+
+    if data.startswith("ignore_"):
+        target_id = int(data.split("_")[1])
+        decrement_violation(target_id)
+        try:
+            # 使用細顆粒度權限恢復用戶權限
+            await context.bot.restrict_chat_member(
+                chat_id=query.message.chat_id,
+                user_id=target_id,
+                permissions=ChatPermissions(
+                    can_send_messages=True,
+                    can_send_audios=True,
+                    can_send_documents=True,
+                    can_send_photos=True,
+                    can_send_videos=True,
+                    can_send_video_notes=True,
+                    can_send_voice_notes=True,
+                    can_send_polls=True,
+                    can_send_other_messages=True,
+                    can_add_web_page_previews=True,
+                    can_invite_users=True
+                )
+            )
+        except Exception as e:
+            logging.error(f"解除禁言失敗: {e}")
+        
+        try:
+            await context.bot.unban_chat_member(chat_id=query.message.chat_id, user_id=target_id, only_if_banned=True)
+        except: pass
+        
+        try: await query.message.delete()
+        except: pass
+    elif data.startswith("ban_"):
+        target_id = int(data.split("_")[1])
+        try:
+            await context.bot.ban_chat_member(chat_id=query.message.chat_id, user_id=target_id)
+            remove_violation(target_id)
+            await query.message.edit_text(f"🛡️ <b>管理員處置</b>\n用戶 <code>{target_id}</code> 已被永久封鎖。", parse_mode='HTML')
+        except Exception as e:
+            await query.message.edit_text(f"❌ 封鎖失敗：{str(e)}")
 
 async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message or update.edited_message
@@ -262,6 +341,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler('delcwl', del_channel_whitelist_command))
     app.add_handler(CommandHandler('addword', add_word_command))
     app.add_handler(CommandHandler('delword', del_word_command))
+    app.add_handler(CallbackQueryHandler(button_callback_handler))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, check_message))
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & ~filters.COMMAND, check_message))
     print("機器人啟動..."); app.run_polling()
